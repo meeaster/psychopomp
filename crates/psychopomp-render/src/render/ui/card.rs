@@ -3,6 +3,7 @@ use psychopomp::{
     footage::Treatment,
     math::{Vec2, shapes::polygon_distance},
 };
+use rayon::prelude::*;
 
 use super::{super::blend_pixel, super::theme::mix, Bounds, rounded_rect_distance};
 
@@ -1088,28 +1089,19 @@ fn for_each_card_row(
     let row_bytes = destination_size[0] as usize * BYTES_PER_PIXEL;
     let rows = &mut destination[start_y * row_bytes..end_y * row_bytes];
     let row_count = end_y - start_y;
-    let workers = std::thread::available_parallelism()
-        .map_or(1, usize::from)
-        .min(row_count / 32)
-        .max(1);
-    if workers <= 1 {
+    if row_count / 32 <= 1 {
         for (offset, row) in rows.chunks_exact_mut(row_bytes).enumerate() {
             paint_row((start_y + offset) as i32, row);
         }
         return;
     }
-    let rows_per_worker = row_count.div_ceil(workers);
+    // Rayon's pool persists: a shell recomposed every shutter sample of a
+    // window's entrance would otherwise start fresh threads each time.
     let paint_row = &paint_row;
-    std::thread::scope(|scope| {
-        for (chunk_index, band) in rows.chunks_mut(rows_per_worker * row_bytes).enumerate() {
-            let band_start_y = start_y + chunk_index * rows_per_worker;
-            scope.spawn(move || {
-                for (offset, row) in band.chunks_exact_mut(row_bytes).enumerate() {
-                    paint_row((band_start_y + offset) as i32, row);
-                }
-            });
-        }
-    });
+    rows.par_chunks_exact_mut(row_bytes)
+        .with_min_len(16)
+        .enumerate()
+        .for_each(|(offset, row)| paint_row((start_y + offset) as i32, row));
 }
 
 fn composite_card_region(
