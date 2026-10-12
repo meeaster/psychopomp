@@ -62,6 +62,7 @@ pub(crate) fn encode_exposures<K: PartialEq>(
             duration
         );
     }
+    crate::timings::reset();
     let started = Instant::now();
     let frame_count = window.duration().frame_count(FPS);
     let media = media
@@ -83,11 +84,18 @@ pub(crate) fn encode_exposures<K: PartialEq>(
             .min(window.end().as_seconds());
         let center = (frame_start + frame_end) * 0.5;
         let samples = samples_at(center).max(1);
+        let timing = crate::timings::start();
         let exposure = merge_equal_samples(
             exposure(center, frame_end - frame_start, samples),
             &mut sample_key,
         )?;
-        encoder.write_frame(render_exposure(renderer, &exposure)?)?;
+        crate::timings::record("sample keys", timing);
+        let timing = crate::timings::start();
+        let pixels = render_exposure(renderer, &exposure)?;
+        crate::timings::record("frame exposure", timing);
+        let timing = crate::timings::start();
+        encoder.write_frame(pixels)?;
+        crate::timings::record("encoder enqueue", timing);
         if frame % u64::from(FPS) == 0 || frame + 1 == frame_count {
             eprintln!(
                 "Rendered {:>3}/{frame_count} frames ({center:.1}s, {samples} samples, {} unique)",
@@ -96,7 +104,10 @@ pub(crate) fn encode_exposures<K: PartialEq>(
             );
         }
     }
+    let timing = crate::timings::start();
     encoder.finish()?;
+    crate::timings::record("encoder finish", timing);
+    crate::timings::report();
     eprintln!(
         "Wrote {} in {:.1}s",
         output.display(),

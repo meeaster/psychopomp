@@ -5,6 +5,7 @@ mod exposure;
 mod footage;
 mod plan_runtime;
 mod render;
+mod timings;
 mod video;
 
 use std::{fs, path::PathBuf};

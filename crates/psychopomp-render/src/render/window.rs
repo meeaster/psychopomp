@@ -184,8 +184,10 @@ impl HeadlessRenderer {
                 }
             }
             let bar = cached.bar.as_ref().filter(|_| chrome.bar);
+            let timing = crate::timings::start();
             cached.shell =
                 Some(self.compose_shell(bounds, pose, chrome, key, bar, &mut cached.layer)?);
+            crate::timings::record("window shell compose", timing);
             cached.blended.opacity = None;
         }
         let shell = cached.shell.as_ref().expect("composed above");

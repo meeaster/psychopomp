@@ -705,8 +705,11 @@ impl HeadlessRenderer {
                 depth_or_array_layers: 1,
             },
         );
+        let timing = crate::timings::start();
         self.queue.submit([encoder.finish()]);
+        crate::timings::record("readback submit", timing);
 
+        let timing = crate::timings::start();
         let slice = self.readback.slice(..);
         let (sender, receiver) = mpsc::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -719,7 +722,9 @@ impl HeadlessRenderer {
             .recv()
             .context("receive GPU readback result")?
             .context("map GPU readback buffer")?;
+        crate::timings::record("GPU wait + map", timing);
 
+        let timing = crate::timings::start();
         let unpadded_bytes_per_row = self.spec.width as usize * BYTES_PER_PIXEL as usize;
         let bytes = slice.get_mapped_range().context("read mapped GPU frame")?;
         let mut frame_bytes =
@@ -732,6 +737,7 @@ impl HeadlessRenderer {
         }
         drop(bytes);
         self.readback.unmap();
+        crate::timings::record("readback copy", timing);
         Ok(frame_bytes)
     }
 

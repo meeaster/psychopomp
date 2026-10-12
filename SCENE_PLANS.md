@@ -135,6 +135,20 @@ A Render Window trims and rebases intersecting media to output time zero, but vi
 
 Delivery remains frame-based: a window whose duration is not exactly frame-aligned emits one final frame sampled only within the remaining window interval. At 60 fps, the encoded duration therefore rounds up to the next frame boundary.
 
+To profile video export, set `PSYCHOPOMP_RENDER_TIMINGS=1` on the render command:
+
+```sh
+PSYCHOPOMP_RENDER_TIMINGS=1 cargo run --release -- plan render target/agent-demo.json output/window.mp4 --range 0.2..0.4
+```
+
+The report lists CPU wall time and call counts for exposure rendering, Stage
+preparation and submissions, GPU readback, window-shell composition, and encoder
+handoff. Nested categories overlap, so their totals cannot be added.
+`GPU wait + map` includes pending GPU work and mapping overhead, not GPU timestamp
+measurements.
+The report resets for each video export and is off by default. Compare runs at
+the same resolution, frame count, shutter sampling, and build profile.
+
 ## Play As A Presentation
 
 The themed slideshow-component showroom runs natively:

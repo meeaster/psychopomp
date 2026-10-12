@@ -157,6 +157,7 @@ Renderer crate, pixels and delivery:
 - `crates/psychopomp-render/src/video.rs`: FFmpeg-decoded seekable RGBA frame cache for input video and image sequences, keyed by source content and decode contract
 - `crates/psychopomp-render/src/footage.rs`: the footage store: every source a plan shows, opened once and shared, with frames read through one bounded LRU
 - `crates/psychopomp-render/src/exposure.rs`: delivery dimensions, shutter samples and weights, linear-light accumulation, and encoding a timeline one exposed frame at a time
+- `crates/psychopomp-render/src/timings.rs`: opt-in per-export CPU wall timings and call counts, enabled with `PSYCHOPOMP_RENDER_TIMINGS=1`
 - `crates/psychopomp-render/src/encode.rs`: concrete FFmpeg subprocess fed from a writer thread, so the next frame renders while FFmpeg takes this one; raw RGBA protocol and compiled audio placement
 
 Scene Programs (`scenes/`), each emitting a Scene Plan, Deck, or Reel:

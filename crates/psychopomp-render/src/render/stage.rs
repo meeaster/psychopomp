@@ -970,6 +970,7 @@ impl HeadlessRenderer {
             .context("an exposure needs at least one sample")?;
         let mut post = [[0.0; 4]; 5];
         for (index, &(time, weight)) in exposure.iter().enumerate() {
+            let timing = crate::timings::start();
             let value = |property: &str, default: f32| value(time, property, default);
             // Writes land before the next submission, so each sample's
             // frames are in the atlas when its primitives draw.
@@ -994,6 +995,7 @@ impl HeadlessRenderer {
                 post = post_settings(plan, &scene, &value, look, time);
             }
             let exposure = [weight, scene.camera.roll, scene.camera.cover()];
+            crate::timings::record("stage CPU sample", timing);
             self.draw_sample(gpu, &prims, &points, look.background, exposure, index == 0);
         }
         self.develop(gpu, post)
@@ -1012,6 +1014,7 @@ impl HeadlessRenderer {
         [weight, roll, cover]: [f32; 3],
         first: bool,
     ) {
+        let timing = crate::timings::start();
         self.queue
             .write_buffer(&gpu.prims, 0, bytemuck::cast_slice(prims));
         if !points.is_empty() {
@@ -1074,7 +1077,10 @@ impl HeadlessRenderer {
         );
         // Buffer writes land before their submission runs, so each sample
         // submits before the next overwrites its primitives.
+        crate::timings::record("stage encode + upload", timing);
+        let timing = crate::timings::start();
         self.queue.submit([encoder.finish()]);
+        crate::timings::record("stage sample submit", timing);
     }
 
     /// Bloom and composite the finished exposure into the frame. `post` is

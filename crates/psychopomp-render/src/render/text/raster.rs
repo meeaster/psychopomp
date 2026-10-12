@@ -90,6 +90,15 @@ pub(crate) fn blend_pixel(destination: &mut [u8], source: [u8; 4], opacity: f32)
     if source_alpha <= 0.0 {
         return;
     }
+    // A fresh transparent layer needs only the source's straight RGB and
+    // weighted alpha. Opaque sources similarly replace the destination. The
+    // 1e-6 floor keeps tiny alpha on the original path, where subnormal
+    // multiply/divide rounding can change the RGB bytes.
+    if (destination[3] == 0 && (1e-6..=1.0).contains(&source_alpha)) || source_alpha == 1.0 {
+        destination[..3].copy_from_slice(&source[..3]);
+        destination[3] = (source_alpha * 255.0).round() as u8;
+        return;
+    }
     let destination_alpha = f32::from(destination[3]) / 255.0;
     let output_alpha = source_alpha + destination_alpha * (1.0 - source_alpha);
     for channel in 0..3 {
@@ -106,6 +115,57 @@ pub(crate) fn blend_pixel(destination: &mut [u8], source: [u8; 4], opacity: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn transparent_and_opaque_blends_preserve_straight_color_and_weighted_alpha() {
+        for channel in 0..=255 {
+            for alpha in 1..=255 {
+                let source = [channel, 255 - channel, channel / 2, alpha];
+                for opacity in [0.001, 0.125, 0.5, 0.97, 1.0] {
+                    let mut pixel = [73, 29, 183, 0];
+                    blend_pixel(&mut pixel, source, opacity);
+                    assert_eq!(&pixel[..3], &source[..3]);
+                    assert_eq!(
+                        pixel[3],
+                        (f32::from(alpha) / 255.0 * opacity * 255.0).round() as u8
+                    );
+                }
+            }
+            let source = [channel, 255 - channel, channel / 2, 255];
+            for alpha in 0..=255 {
+                let mut pixel = [73, 29, 183, alpha];
+                blend_pixel(&mut pixel, source, 1.0);
+                assert_eq!(pixel, source);
+            }
+        }
+    }
+
+    #[test]
+    fn transparent_blend_matches_expected_bytes_around_alpha_cutoff() {
+        // Opaque source alpha makes opacity the effective alpha exactly.
+        // Adjacent f32 values straddle 1e-6; the weighted alpha still rounds to zero.
+        let cutoff = 1e-6_f32;
+        let source = [1, 128, 254, 255];
+        for opacity in [
+            f32::from_bits(cutoff.to_bits() - 1),
+            cutoff,
+            f32::from_bits(cutoff.to_bits() + 1),
+        ] {
+            let mut pixel = [73, 29, 183, 0];
+            blend_pixel(&mut pixel, source, opacity);
+            assert_eq!(pixel, [1, 128, 254, 0], "opacity={opacity:?}");
+        }
+    }
+
+    #[test]
+    fn transparent_blend_preserves_original_rounding_for_subnormal_alpha() {
+        // With the least subnormal alpha, 1/255 * alpha underflows to zero,
+        // while 128/255 * alpha rounds back to alpha. The original division
+        // therefore yields RGB [0, 255, 255]; weighted alpha rounds to zero.
+        let mut pixel = [73, 29, 183, 0];
+        blend_pixel(&mut pixel, [1, 128, 255, 255], f32::from_bits(1));
+        assert_eq!(pixel, [0, 255, 255, 0]);
+    }
+
     #[test]
     fn overlapping_rectangles_keep_straight_alpha_bytes_and_clip_at_the_original_origin() {
         let mut pixel = [0; 4];
