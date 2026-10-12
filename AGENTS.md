@@ -36,7 +36,10 @@ bun scripts/narrate.ts <scene>/narration/script.json [--draft]
 ```
 
 Rendering needs a working `wgpu` adapter and `ffmpeg` with `libx264`; fonts are
-bundled. Do not render full films as routine validation; render when rendering,
+bundled. wgpu reads its environment variables (`WGPU_BACKEND`,
+`WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER`, and the rest), so a machine whose
+only GPU route is a non-conformant driver, such as Mesa's Dozen under WSL, can
+opt in per command. Do not render full films as routine validation; render when rendering,
 typography, choreography, sampling, or encoding changes.
 
 ## Architecture

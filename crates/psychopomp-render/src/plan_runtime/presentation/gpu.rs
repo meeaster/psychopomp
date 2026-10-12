@@ -43,7 +43,8 @@ pub(super) struct Presenter {
 
 impl Presenter {
     pub(super) async fn new(window: Arc<Window>) -> Result<Self> {
-        let instance = wgpu::Instance::default();
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance
             .create_surface(window.clone())
             .context("create native GPU surface")?;
