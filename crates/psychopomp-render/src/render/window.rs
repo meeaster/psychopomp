@@ -79,13 +79,49 @@ pub(crate) struct WindowChrome<'a> {
 /// window's pose holds still while its content moves, so most samples blend
 /// this layer instead of projecting the card again.
 #[derive(Default)]
-pub(crate) struct ShellCache(RefCell<Option<Shell>>);
+pub(crate) struct ShellCache(RefCell<Cached>);
+
+#[derive(Default)]
+struct Cached {
+    shell: Option<Shell>,
+    /// The title bar, which only its title, width, fill, and theme change; a
+    /// window springing into place keeps it while its scale moves.
+    bar: Option<Bar>,
+    /// The full-frame scratch a shell is composed in, kept between shells.
+    layer: Vec<u8>,
+    blended: Blended,
+}
 
 struct Shell {
     key: ShellKey,
     origin: [usize; 2],
     size: [usize; 2],
     pixels: Vec<u8>,
+}
+
+struct Bar {
+    key: BarKey,
+    pixels: Vec<u8>,
+    size: [u32; 2],
+}
+
+#[derive(PartialEq)]
+struct BarKey {
+    theme: Theme,
+    title: Option<String>,
+    width: u32,
+    fill: [u8; 3],
+}
+
+/// The shell's last blend: the frame pixels it covered and the result. A
+/// frame's shutter samples share the backdrop beneath a window, so later
+/// samples copy the result instead of blending the shadow again. `opacity` is
+/// `None` until the current shell has blended once.
+#[derive(Default)]
+struct Blended {
+    opacity: Option<u32>,
+    under: Vec<u8>,
+    over: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -129,16 +165,55 @@ impl HeadlessRenderer {
             corner_radius: chrome.corner_radius.to_bits(),
         };
         let mut cached = cache.0.borrow_mut();
-        if cached.as_ref().is_none_or(|shell| shell.key != key) {
-            *cached = Some(self.compose_shell(bounds, pose, chrome, key)?);
+        let cached = &mut *cached;
+        if cached.shell.as_ref().is_none_or(|shell| shell.key != key) {
+            if chrome.bar {
+                let bar_key = BarKey {
+                    theme: self.theme,
+                    title: chrome.title.map(str::to_owned),
+                    width: bounds.size[0].to_bits(),
+                    fill: chrome.fill,
+                };
+                if cached.bar.as_ref().is_none_or(|bar| bar.key != bar_key) {
+                    let (pixels, size) = self.window_bar(chrome.title, bounds.size[0], chrome.fill);
+                    cached.bar = Some(Bar {
+                        key: bar_key,
+                        pixels,
+                        size,
+                    });
+                }
+            }
+            let bar = cached.bar.as_ref().filter(|_| chrome.bar);
+            cached.shell =
+                Some(self.compose_shell(bounds, pose, chrome, key, bar, &mut cached.layer)?);
+            cached.blended.opacity = None;
         }
-        let shell = cached.as_ref().expect("composed above");
+        let shell = cached.shell.as_ref().expect("composed above");
         let width = self.spec.width as usize;
-        for row in 0..shell.size[1] {
-            let source = row * shell.size[0] * 4;
-            let target = ((shell.origin[1] + row) * width + shell.origin[0]) * 4;
-            let source = &shell.pixels[source..source + shell.size[0] * 4];
-            let target = &mut pixels[target..target + shell.size[0] * 4];
+        let span = shell.size[0] * 4;
+        let rows = (0..shell.size[1])
+            .map(|row| ((shell.origin[1] + row) * width + shell.origin[0]) * 4)
+            .collect::<Vec<_>>();
+        let opacity = pose.opacity.to_bits();
+        let blended = &mut cached.blended;
+        if blended.opacity == Some(opacity)
+            && rows
+                .iter()
+                .zip(blended.under.chunks_exact(span))
+                .all(|(&target, under)| &pixels[target..target + span] == under)
+        {
+            for (&target, over) in rows.iter().zip(blended.over.chunks_exact(span)) {
+                pixels[target..target + span].copy_from_slice(over);
+            }
+            return Ok(());
+        }
+        blended.opacity = Some(opacity);
+        blended.under.clear();
+        blended.over.clear();
+        for (row, &target) in rows.iter().enumerate() {
+            let source = &shell.pixels[row * span..(row + 1) * span];
+            let target = &mut pixels[target..target + span];
+            blended.under.extend_from_slice(target);
             for (pixel, layer) in target
                 .as_chunks_mut::<4>()
                 .0
@@ -151,6 +226,7 @@ impl HeadlessRenderer {
                     blend_pixel(pixel, *layer, pose.opacity);
                 }
             }
+            blended.over.extend_from_slice(target);
         }
         Ok(())
     }
@@ -161,6 +237,8 @@ impl HeadlessRenderer {
         pose: WindowPose,
         chrome: WindowChrome<'_>,
         key: ShellKey,
+        bar: Option<&Bar>,
+        layer: &mut Vec<u8>,
     ) -> Result<Shell> {
         let palette = self.theme.palette();
         let [r, g, b] = chrome.fill;
@@ -182,13 +260,11 @@ impl HeadlessRenderer {
             },
             opacity: 1.0,
         };
-        let bar = chrome
-            .bar
-            .then(|| self.window_bar(chrome.title, bounds.size[0], chrome.fill));
         let empty = [0_u8; 4];
         let [width, height] = [self.spec.width as usize, self.spec.height as usize];
-        let mut layer = vec![0_u8; width * height * 4];
-        self.composite_ui(&mut layer, |ui| {
+        layer.clear();
+        layer.resize(width * height * 4, 0);
+        self.composite_ui(layer, |ui| {
             // No content: the shell alone, with its material.
             ui.card_source(
                 card,
@@ -204,10 +280,10 @@ impl HeadlessRenderer {
                     },
                 },
             )?;
-            if let Some((bar, size)) = &bar {
+            if let Some(bar) = bar {
                 ui.card_layer(
                     card,
-                    RgbaSource::packed(bar, *size)?,
+                    RgbaSource::packed(&bar.pixels, bar.size)?,
                     Bounds {
                         origin: [0.0, 0.0],
                         size: [bounds.size[0], TITLE_BAR],
@@ -216,12 +292,22 @@ impl HeadlessRenderer {
             }
             Ok(())
         })?;
-        // Crop to the inked rows and columns.
-        let inked = |x: usize, y: usize| layer[(y * width + x) * 4 + 3] != 0;
-        let rows = (0..height)
-            .filter(|&y| (0..width).any(|x| inked(x, y)))
-            .collect::<Vec<_>>();
-        let (Some(&top), Some(&bottom)) = (rows.first(), rows.last()) else {
+        // Crop to the inked rows and columns, in one pass over the rows.
+        let mut rows: Option<[usize; 2]> = None;
+        let mut columns = [usize::MAX, 0];
+        for (y, row) in layer.chunks_exact(width * 4).enumerate() {
+            let pixels = row.as_chunks::<4>().0;
+            let Some(first) = pixels.iter().position(|pixel| pixel[3] != 0) else {
+                continue;
+            };
+            let last = pixels
+                .iter()
+                .rposition(|pixel| pixel[3] != 0)
+                .expect("found above");
+            columns = [columns[0].min(first), columns[1].max(last)];
+            rows = Some([rows.map_or(y, |[top, _]| top), y]);
+        }
+        let Some([top, bottom]) = rows else {
             return Ok(Shell {
                 key,
                 origin: [0, 0],
@@ -229,13 +315,7 @@ impl HeadlessRenderer {
                 pixels: Vec::new(),
             });
         };
-        let columns = (0..width)
-            .filter(|&x| (top..=bottom).any(|y| inked(x, y)))
-            .collect::<Vec<_>>();
-        let (left, right) = (
-            columns[0],
-            *columns.last().expect("an inked row has a column"),
-        );
+        let [left, right] = columns;
         let size = [right - left + 1, bottom - top + 1];
         let mut pixels = Vec::with_capacity(size[0] * size[1] * 4);
         for y in top..=bottom {

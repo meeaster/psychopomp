@@ -1,16 +1,22 @@
 use std::{
     fs,
-    io::Write,
+    io::{self, Write},
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    process::{Child, Command, Stdio},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc::{self, SyncSender},
+    },
+    thread::{self, JoinHandle},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use psychopomp::composition::MediaPlacement;
 
 static NEXT_TEMPORARY_OUTPUT: AtomicU64 = AtomicU64::new(0);
+/// Frames queued for FFmpeg while the next one renders.
+const QUEUED_FRAMES: usize = 2;
 
 #[derive(Clone, Copy)]
 pub struct VideoSpec {
@@ -19,9 +25,11 @@ pub struct VideoSpec {
     pub fps: u32,
 }
 
+/// Streams frames to FFmpeg from a writer thread, so rendering the next frame
+/// overlaps the encoder taking this one.
 pub struct FfmpegEncoder {
     child: Option<Child>,
-    stdin: Option<ChildStdin>,
+    writer: Option<Writer>,
     frame_bytes: usize,
     output: PathBuf,
     temporary_output: PathBuf,
@@ -120,7 +128,7 @@ impl FfmpegEncoder {
 
         Ok(Self {
             child: Some(child),
-            stdin: Some(stdin),
+            writer: Some(Writer::spawn(stdin)?),
             frame_bytes: spec.width as usize * spec.height as usize * 4,
             output: output.to_owned(),
             temporary_output,
@@ -128,7 +136,7 @@ impl FfmpegEncoder {
         })
     }
 
-    pub fn write_frame(&mut self, rgba: &[u8]) -> Result<()> {
+    pub fn write_frame(&mut self, rgba: Vec<u8>) -> Result<()> {
         if rgba.len() != self.frame_bytes {
             bail!(
                 "expected {} RGBA frame bytes, received {}",
@@ -136,15 +144,23 @@ impl FfmpegEncoder {
                 rgba.len()
             );
         }
-        self.stdin
-            .as_mut()
-            .context("FFmpeg input is already closed")?
-            .write_all(rgba)
-            .context("stream frame to FFmpeg")
+        let writer = self
+            .writer
+            .as_ref()
+            .context("FFmpeg input is already closed")?;
+        if writer.frames.send(rgba).is_err() {
+            // The writer stopped on an error; report it.
+            self.writer.take().expect("checked above").close()?;
+            bail!("FFmpeg input closed early");
+        }
+        Ok(())
     }
 
     pub fn finish(mut self) -> Result<()> {
-        self.stdin.take();
+        self.writer
+            .take()
+            .context("FFmpeg input is already closed")?
+            .close()?;
         let status = self
             .child
             .as_mut()
@@ -164,6 +180,37 @@ impl FfmpegEncoder {
         })?;
         self.finished = true;
         Ok(())
+    }
+}
+
+/// The thread that owns FFmpeg's stdin and writes queued frames in order.
+struct Writer {
+    frames: SyncSender<Vec<u8>>,
+    thread: JoinHandle<io::Result<()>>,
+}
+
+impl Writer {
+    fn spawn(mut stdin: impl Write + Send + 'static) -> Result<Self> {
+        let (frames, queued) = mpsc::sync_channel::<Vec<u8>>(QUEUED_FRAMES);
+        let thread = thread::Builder::new()
+            .name("ffmpeg-writer".to_owned())
+            .spawn(move || {
+                for frame in queued {
+                    stdin.write_all(&frame)?;
+                }
+                Ok(())
+            })
+            .context("start FFmpeg writer thread")?;
+        Ok(Self { frames, thread })
+    }
+
+    /// Write what is queued, close FFmpeg's input, and report a failed write.
+    fn close(self) -> Result<()> {
+        drop(self.frames);
+        self.thread
+            .join()
+            .map_err(|_| anyhow!("FFmpeg writer thread panicked"))?
+            .context("stream frame to FFmpeg")
     }
 }
 
@@ -192,10 +239,14 @@ fn audio_clip_filter(
 
 impl Drop for FfmpegEncoder {
     fn drop(&mut self) {
-        self.stdin.take();
+        let writer = self.writer.take();
         if let Some(mut child) = self.child.take() {
             if child.try_wait().ok().flatten().is_none() {
                 let _ = child.kill();
+            }
+            // With FFmpeg gone, a blocked write fails and the writer exits.
+            if let Some(writer) = writer {
+                let _ = writer.close();
             }
             let _ = child.wait();
         }

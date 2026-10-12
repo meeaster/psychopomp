@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque, hash_map::DefaultHasher},
     hash::{Hash, Hasher},
     sync::mpsc,
@@ -1688,7 +1689,55 @@ fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], dr
     let right = x - source_left + source_clip[1].ceil() + reach_x + 1.0;
     let top = (y - reach_y - 1.0).max(clip_y[0]);
     let bottom = (y + sprite.height as f32 + reach_y + 1.0).min(clip_y[1]);
-    for target_y in (top.floor() as i32).max(0)..(bottom.ceil() as i32).min(canvas_height as i32) {
+    let rows = (top.floor() as i32).max(0)..(bottom.ceil() as i32).min(canvas_height as i32);
+    let columns = (left.floor() as i32).max(0)..(right.ceil() as i32).min(canvas_width as i32);
+    if rows.is_empty() || columns.is_empty() {
+        return;
+    }
+    let spans = rows
+        .clone()
+        .map(|row| {
+            let start = (row as usize * canvas_width as usize + columns.start as usize) * 4;
+            start..start + columns.len() * 4
+        })
+        .collect::<Vec<_>>();
+    let key = TextMemoKey {
+        canvas: [canvas_width, canvas_height],
+        sprite: [sprite.width, sprite.height],
+        origin: [x, y].map(f32::to_bits),
+        source_left: source_left.to_bits(),
+        clip_width: clip_width.to_bits(),
+        filter: match filter {
+            TextFilter::Blur(blur) => [0, blur.to_bits(), 0],
+            TextFilter::Smear { sigma, amount } => [1, sigma.to_bits(), amount.to_bits()],
+        },
+        opacity: opacity.to_bits(),
+        clip_y: clip_y.map(f32::to_bits),
+        mask: mask.map(|mask| [mask.top, mask.bottom, mask.fade].map(f32::to_bits)),
+    };
+    let repeated = TEXT_MEMO.with_borrow(|memo| {
+        let memo = memo.get(&key)?;
+        let under = memo.under.chunks_exact(columns.len() * 4);
+        (memo.sprite == sprite.pixels
+            && spans
+                .iter()
+                .zip(under)
+                .all(|(span, under)| &canvas[span.clone()] == under))
+        .then(|| {
+            for (span, over) in spans.iter().zip(memo.over.chunks_exact(columns.len() * 4)) {
+                canvas[span.clone()].copy_from_slice(over);
+            }
+        })
+    });
+    if repeated.is_some() {
+        return;
+    }
+    let under = spans
+        .iter()
+        .flat_map(|span| &canvas[span.clone()])
+        .copied()
+        .collect::<Vec<_>>();
+    for target_y in rows {
         let row_start = (target_y as f32).max(clip_y[0]);
         let row_end = (target_y as f32 + 1.).min(clip_y[1]);
         let coverage_y = mask.map_or_else(
@@ -1698,8 +1747,7 @@ fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], dr
         if coverage_y <= 0. {
             continue;
         }
-        for target_x in (left.floor() as i32).max(0)..(right.ceil() as i32).min(canvas_width as i32)
-        {
+        for target_x in columns.clone() {
             let source_x = source_left + target_x as f32 - x;
             let source_y = target_y as f32 - y;
             let mut color = [0.0; 4];
@@ -1745,6 +1793,55 @@ fn composite_text(canvas: &mut [u8], [canvas_width, canvas_height]: [u32; 2], dr
             blend_pixel(&mut canvas[target_index..target_index + 4], source, opacity);
         }
     }
+    let over = spans
+        .iter()
+        .flat_map(|span| &canvas[span.clone()])
+        .copied()
+        .collect::<Vec<_>>();
+    TEXT_MEMO.with_borrow_mut(|memo| {
+        if memo.len() >= TEXT_MEMO_ENTRIES && !memo.contains_key(&key) {
+            memo.clear();
+        }
+        memo.insert(
+            key,
+            TextMemo {
+                sprite: sprite.pixels.clone(),
+                under,
+                over,
+            },
+        );
+    });
+}
+
+/// Every parameter of a text draw besides its sprite's pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct TextMemoKey {
+    canvas: [u32; 2],
+    sprite: [u32; 2],
+    origin: [u32; 2],
+    source_left: u32,
+    clip_width: u32,
+    filter: [u32; 3],
+    opacity: u32,
+    clip_y: [u32; 2],
+    mask: Option<[u32; 3]>,
+}
+
+/// A text draw's last result: the sprite it drew, the canvas pixels it
+/// covered, and what it left there. A frame's shutter samples redraw still
+/// text over the same pixels, so a repeat copies the result instead of
+/// filtering the sprite again.
+struct TextMemo {
+    sprite: Vec<u8>,
+    under: Vec<u8>,
+    over: Vec<u8>,
+}
+
+/// Draws remembered per thread before the memo starts over.
+const TEXT_MEMO_ENTRIES: usize = 256;
+
+thread_local! {
+    static TEXT_MEMO: RefCell<HashMap<TextMemoKey, TextMemo>> = RefCell::new(HashMap::new());
 }
 
 /// Premultiplied RGBA interpolation avoids dark fringes around transparent glyphs.

@@ -342,7 +342,9 @@ mod tests {
                         request.debug = Some(DebugState::capture(&clock, sample));
                         request.stamp.debug = true;
                         video
-                            .write_frame(&cache.render(&mut renderer, &prepared, &request).unwrap())
+                            .write_frame(Arc::unwrap_or_clone(
+                                cache.render(&mut renderer, &prepared, &request).unwrap(),
+                            ))
                             .unwrap();
                     }
                     video.finish().unwrap();

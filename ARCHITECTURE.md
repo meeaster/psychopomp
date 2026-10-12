@@ -157,7 +157,7 @@ Renderer crate, pixels and delivery:
 - `crates/psychopomp-render/src/video.rs`: FFmpeg-decoded seekable RGBA frame cache for input video and image sequences, keyed by source content and decode contract
 - `crates/psychopomp-render/src/footage.rs`: the footage store: every source a plan shows, opened once and shared, with frames read through one bounded LRU
 - `crates/psychopomp-render/src/exposure.rs`: delivery dimensions, shutter samples and weights, linear-light accumulation, and encoding a timeline one exposed frame at a time
-- `crates/psychopomp-render/src/encode.rs`: concrete FFmpeg subprocess, raw RGBA protocol, and compiled audio placement
+- `crates/psychopomp-render/src/encode.rs`: concrete FFmpeg subprocess fed from a writer thread, so the next frame renders while FFmpeg takes this one; raw RGBA protocol and compiled audio placement
 
 Scene Programs (`scenes/`), each emitting a Scene Plan, Deck, or Reel:
 
@@ -980,7 +980,14 @@ Every root renders a frame from one exposure, `exposure::exposure`: stratified
 times across a 180-degree shutter whose weights ease off over the outer quarter
 at each end, so streaks fade rather than ending on a hard copy. Samples with
 equal visual keys merge their weights. Roots without their own exposure average
-sRGB samples in linear light on the CPU (`exposure::accumulate`).
+sRGB samples in linear light on the CPU (`exposure::accumulate`), summing only
+the 64-pixel blocks where a sample differs from the first; every other pixel
+takes the same weighted average through a per-value table, so the exposure is
+bit-identical. A Reel segment fading alone through a dip exposes once through its
+own root and fades over the empty background by its shutter-weighted opacity.
+CPU overlays repeat across a frame's samples, so a window's shell blend and each
+text draw remember their last result and copy it when the pixels beneath and
+every parameter match.
 
 The Stage separates material response from transforms: a pulse lights the orb
 without moving its shell or ports, and a card flash lifts ink and rim while its

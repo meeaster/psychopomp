@@ -149,6 +149,34 @@ impl PreparedReel {
         Some((segment?, local))
     }
 
+    /// The segment shown alone, but fading, through a whole exposure. `None`
+    /// unless it fades.
+    fn faded_segment(&self, exposure: &[(f64, f32)]) -> Option<Faded> {
+        let mut segment = None;
+        let mut local = Vec::with_capacity(exposure.len());
+        let mut opacity = 0.0;
+        for &(time, weight) in exposure {
+            let layers = self.reel.layers_at(time);
+            let [layer] = layers.as_slice() else {
+                return None;
+            };
+            if layer.zoom.is_some()
+                || layer.wipe.is_some()
+                || layer.transition.is_some()
+                || *segment.get_or_insert(layer.segment) != layer.segment
+            {
+                return None;
+            }
+            local.push((layer.local_seconds, weight));
+            opacity += layer.weight.clamp(0.0, 1.0) * weight;
+        }
+        (opacity < 1.0).then_some(Faded {
+            segment: segment?,
+            local,
+            opacity,
+        })
+    }
+
     pub(super) fn temporal_samples(&self, center: f64) -> u32 {
         match self.sole_segment(&[(center, 1.0)]) {
             Some((segment, local)) => self.segments[segment].temporal_samples(local[0].0),
@@ -158,8 +186,9 @@ impl PreparedReel {
     }
 
     /// One exposed frame. A segment shown alone renders its own exposure (a
-    /// Stage accumulates on the GPU); mixes, zooms, wipes, and composited
-    /// transitions average on the CPU.
+    /// Stage accumulates on the GPU); one fading through a dip exposes once
+    /// and fades by its average opacity across the shutter; mixes, zooms,
+    /// wipes, and composited transitions average on the CPU.
     pub(super) fn render_exposure(
         &self,
         renderer: &mut HeadlessRenderer,
@@ -169,6 +198,19 @@ impl PreparedReel {
             let prepared = &self.segments[segment];
             renderer.set_file_name(prepared.file_name());
             return prepared.render_exposure(renderer, &local);
+        }
+        if let Some(Faded {
+            segment,
+            local,
+            opacity,
+        }) = self.faded_segment(exposure)
+        {
+            let prepared = &self.segments[segment];
+            renderer.set_file_name(prepared.file_name());
+            let exposed = prepared.render_exposure(renderer, &local)?;
+            let mut below = renderer.render_title_card("", None, 0.0);
+            crossfade(&mut below, &exposed, opacity);
+            return Ok(below);
         }
         crate::exposure::accumulate(renderer, exposure, |renderer, time| {
             self.render_sample(renderer, time)
@@ -305,6 +347,14 @@ fn mix_covered(below: &mut [u8], above: &[u8], coverage: &[f32], weight: f32) {
 }
 
 /// Mix the opaque `above` frame over the opaque `below` frame by `weight`.
+/// A segment fading alone through an exposure: its local samples and its
+/// shutter-weighted opacity.
+struct Faded {
+    segment: usize,
+    local: Vec<(f64, f32)>,
+    opacity: f32,
+}
+
 fn crossfade(below: &mut [u8], above: &[u8], weight: f32) {
     let weight = weight.clamp(0.0, 1.0);
     for (dst, src) in below.iter_mut().zip(above) {

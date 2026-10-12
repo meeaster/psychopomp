@@ -87,7 +87,7 @@ pub(crate) fn encode_exposures<K: PartialEq>(
             exposure(center, frame_end - frame_start, samples),
             &mut sample_key,
         )?;
-        encoder.write_frame(&render_exposure(renderer, &exposure)?)?;
+        encoder.write_frame(render_exposure(renderer, &exposure)?)?;
         if frame % u64::from(FPS) == 0 || frame + 1 == frame_count {
             eprintln!(
                 "Rendered {:>3}/{frame_count} frames ({center:.1}s, {samples} samples, {} unique)",
@@ -152,31 +152,80 @@ pub(crate) fn merge_equal_samples<K: PartialEq>(
 }
 
 /// Average sRGB frames in linear light by weight: the CPU exposure every
-/// root supports.
-pub(crate) fn accumulate(
-    renderer: &mut HeadlessRenderer,
+/// root supports. Only blocks where a sample differs from the first are
+/// summed; the rest take the same weighted average through a per-value
+/// table, so the result is bit-identical to summing every pixel.
+pub(crate) fn accumulate<R>(
+    renderer: &mut R,
     exposure: &[(f64, f32)],
-    mut render_sample: impl FnMut(&mut HeadlessRenderer, f64) -> Result<Vec<u8>>,
+    mut render_sample: impl FnMut(&mut R, f64) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    if let [(time, _)] = exposure {
-        return render_sample(renderer, *time);
+    let Some((&(time, weight), rest)) = exposure.split_first() else {
+        bail!("an exposure needs at least one sample");
+    };
+    let first = render_sample(renderer, time)?;
+    if rest.is_empty() {
+        return Ok(first);
     }
+    check_frame(&first)?;
     let tables = linear_tables();
+    let mut weights = vec![WeightedLinear::new(tables, weight)];
+    let mut summed = vec![false; FRAME_BYTES / BLOCK_BYTES];
     let mut sum = vec![0.0_f32; FRAME_BYTES];
-    for &(time, weight) in exposure {
+    for &(time, weight) in rest {
         let pixels = render_sample(renderer, time)?;
         check_frame(&pixels)?;
-        let weighted = WeightedLinear::new(tables, weight);
-        for (sum, pixel) in sum
+        weights.push(WeightedLinear::new(tables, weight));
+        let blocks = sum
+            .as_chunks_mut::<BLOCK_BYTES>()
+            .0
+            .iter_mut()
+            .zip(pixels.as_chunks::<BLOCK_BYTES>().0)
+            .zip(first.as_chunks::<BLOCK_BYTES>().0)
+            .zip(&mut summed);
+        for (((sum, pixels), first), summed) in blocks {
+            if !*summed {
+                if pixels == first {
+                    continue;
+                }
+                // Every earlier sample matched the first here.
+                *summed = true;
+                for earlier in &weights[..weights.len() - 1] {
+                    add_block(earlier, sum, first);
+                }
+            }
+            add_block(weights.last().expect("pushed above"), sum, pixels);
+        }
+    }
+    let constant: [[u8; 4]; 256] = std::array::from_fn(|value| {
+        let mut sum = [0.0_f32; 4];
+        for &(_, weight) in exposure {
+            add_linear(tables, &mut sum, &[value as u8; 4], weight);
+        }
+        encode_linear(tables, &sum)
+    });
+    let mut exposed = first;
+    let blocks = exposed
+        .as_chunks_mut::<BLOCK_BYTES>()
+        .0
+        .iter_mut()
+        .zip(sum.as_chunks::<BLOCK_BYTES>().0)
+        .zip(&summed);
+    for ((exposed, sum), &summed) in blocks {
+        for (pixel, sum) in exposed
             .as_chunks_mut::<4>()
             .0
             .iter_mut()
-            .zip(pixels.as_chunks::<4>().0)
+            .zip(sum.as_chunks::<4>().0)
         {
-            weighted.add(sum, pixel);
+            *pixel = if summed {
+                encode_linear(tables, sum)
+            } else {
+                std::array::from_fn(|channel| constant[pixel[channel] as usize][channel])
+            };
         }
     }
-    Ok(encode_frame(tables, &sum))
+    Ok(exposed)
 }
 
 /// `accumulate` for samples that differ only inside `region`. `first` is the
@@ -298,6 +347,20 @@ impl Region {
 }
 
 const FRAME_BYTES: usize = WIDTH as usize * HEIGHT as usize * 4;
+/// `accumulate` compares samples in runs of 64 pixels.
+const BLOCK_BYTES: usize = 64 * 4;
+const _: () = assert!(FRAME_BYTES.is_multiple_of(BLOCK_BYTES));
+
+fn add_block(weighted: &WeightedLinear, sum: &mut [f32], pixels: &[u8]) {
+    for (sum, pixel) in sum
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(pixels.as_chunks::<4>().0)
+    {
+        weighted.add(sum, pixel);
+    }
+}
 
 fn check_frame(pixels: &[u8]) -> Result<()> {
     if pixels.len() != FRAME_BYTES {
@@ -355,19 +418,6 @@ fn encode_linear(tables: &LinearTables, sum: &[f32; 4]) -> [u8; 4] {
     ]
 }
 
-fn encode_frame(tables: &LinearTables, sum: &[f32]) -> Vec<u8> {
-    let mut exposed = vec![0_u8; sum.len() / 4 * 4];
-    for (out, sum) in exposed
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(sum.as_chunks::<4>().0)
-    {
-        *out = encode_linear(tables, sum);
-    }
-    exposed
-}
-
 pub(crate) struct LinearTables {
     pub(crate) to_linear: [f32; 256],
     to_srgb: Vec<u8>,
@@ -410,8 +460,8 @@ mod tests {
     use psychopomp::math::{shapes::Box2, vec2};
 
     use super::{
-        FRAME_BYTES, Region, WeightedLinear, accumulate_region, add_linear, encode_frame,
-        encode_linear, exposure, linear_tables, merge_equal_samples,
+        BLOCK_BYTES, FRAME_BYTES, Region, WeightedLinear, accumulate, accumulate_region,
+        add_linear, encode_linear, exposure, linear_tables, merge_equal_samples,
     };
 
     #[test]
@@ -540,7 +590,12 @@ mod tests {
                 weighted.add(sum, pixel);
             }
         }
-        let optimized = encode_frame(tables, &opt_sum);
+        let optimized: Vec<u8> = opt_sum
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|sum| encode_linear(tables, sum))
+            .collect();
         assert_eq!(
             ref_sum.len(),
             opt_sum.len(),
@@ -554,5 +609,46 @@ mod tests {
             "accumulated f32 sums are IEEE-754 bit-for-bit identical"
         );
         assert_eq!(optimized, reference);
+    }
+
+    #[test]
+    fn accumulate_skips_unchanged_blocks_without_changing_a_bit() {
+        let tables = linear_tables();
+        let first = (0..FRAME_BYTES)
+            .map(|index| (index * 7 % 251) as u8)
+            .collect::<Vec<_>>();
+        // The second sample changes one block; the third changes that block
+        // and another, so the second block is backfilled from earlier samples.
+        let mut second = first.clone();
+        second[BLOCK_BYTES * 3 + 5] ^= 0x5a;
+        let mut third = second.clone();
+        third[BLOCK_BYTES * 3 + 9] ^= 0x33;
+        third[FRAME_BYTES - 2] ^= 0x81;
+        let frames = [first, second, third];
+        let samples = [(0.0, 0.2_f32), (1.0, 0.5), (2.0, 0.3)];
+
+        let mut reference = vec![0.0_f32; FRAME_BYTES];
+        for (frame, &(_, weight)) in frames.iter().zip(&samples) {
+            for (sum, pixel) in reference
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(frame.as_chunks::<4>().0)
+            {
+                add_linear(tables, sum, pixel, weight);
+            }
+        }
+        let reference = reference
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|sum| encode_linear(tables, sum))
+            .collect::<Vec<_>>();
+
+        let exposed = accumulate(&mut (), &samples, |_, time| {
+            Ok(frames[time as usize].clone())
+        })
+        .unwrap();
+        assert_eq!(exposed, reference);
     }
 }
